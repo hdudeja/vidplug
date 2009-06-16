@@ -1,6 +1,88 @@
+import pygst
+pygst.require("0.10")
+import gst
 import gtk
 import gobject
-import gst
+import cairo
+
+from vidplug.typefind import typefind
+
+class TimelineChunk():
+	def __init__(self,filename,timeline_start,timeline_end,file_start,file_end):
+		if file_start>=file_end:
+			raise ValueError("file_start>=file_end")
+		if timeline_start>=timeline_end:
+			raise ValueError("timeline_start>=timeline_end")
+		self.filename=str(filename)
+		self.timeline_start=float(timeline_start)
+		self.timeline_end=float(timeline_end)
+		self.file_start=float(file_start)
+		self.file_end=float(file_end)
+
+class Timeline():
+	def __init__(self):
+		self.layers=[]
+	def add_chunk(self,chunk):
+		done=False
+		for layer in self.layers:
+			#can we simply append this chunk? NB we should not have an empty layer in here, so we won't test for it
+			if layer[-1].timeline_end<=chunk.timeline_start:
+				layer.append(chunk)
+				done=True
+				break
+			for n in range(len(layer)):
+				test_chunk=layer[n]
+				if test_chunk.timeline_start>=chunk.timeline_end:
+					#add the chunk before n
+					layer.insert(n,chunk)
+					done=True
+					break
+				elif test_chunk.timeline_end>chunk.timeline_start:
+					#cannot add chunk to this layer!
+					break
+			if done:
+				break
+		if not done:
+			#ok, no suitable layer was found, append a layer and return it
+			self.layers.append([chunk])
+
+
+class TimelineArea(gtk.DrawingArea):
+	def __init__(self,timeline):
+		gtk.DrawingArea.__init__(self)
+		self.connect("expose-event",self.expose_event)
+		self.timeline=timeline
+	def expose_event(self, widget, event):
+		cr = self.window.cairo_create()
+		cr.rectangle(event.area.x, event.area.y,
+		event.area.width, event.area.height)
+		cr.clip()
+		self.draw(cr, *self.window.get_size())
+
+	def draw(self, cr, width, height):
+		cr.set_source_rgb(0.5, 0.5, 0.5)
+		cr.rectangle(0, 0, width, height)
+		cr.fill()
+		for n in range(len(self.timeline.layers)):
+			layer=self.timeline.layers[n]
+			cr.set_source_rgb(1.0, 0.0, 0.0)
+			cr.set_line_width(1)
+			cr.move_to(0.0, n*100+0.5)
+			cr.line_to(width, n*100.0)
+			cr.stroke()
+			cr.move_to(0.0, (n+1)*100.0-0.5)
+			cr.line_to(width, (n+1)*100.0-0.5)
+			cr.stroke()
+			for chunk in layer:
+				cr.set_source_rgb(0.4, 0.5, 0.9)
+				cr.rectangle(100.0*chunk.timeline_start+0.5,n*100.0+1.5,
+							100.0*(chunk.timeline_end-chunk.timeline_start),97.0)
+				cr.fill()
+				cr.set_source_rgb(0.2, 0.4, 0.6)
+				cr.rectangle(100.0*chunk.timeline_start+0.5,n*100.0+1.5,
+							100.0*(chunk.timeline_end-chunk.timeline_start),97.0)
+				cr.stroke()
+
 
 class Player():
 	def __init__(self,window_xid,rescale_cb,update_cb):
@@ -97,14 +179,21 @@ class Interface():
 		self.player_slider.set_update_policy(gtk.UPDATE_CONTINUOUS)
 		self.player_slider.set_property("draw-value",False)
 		self.player_slider.connect("change-value",self.cb_player_slider_changed)
+		self.timeline=Timeline()
+		self.timelinearea=TimelineArea(self.timeline)
+		self.timelinearea.show()
+		self.timeline.add_chunk(TimelineChunk("beef!",1.5,2,0,1))
+		self.timeline.add_chunk(TimelineChunk("beef!",0,1,0,1))
+		self.timeline.add_chunk(TimelineChunk("beef!",1,1.6,0,1))
+		self.builder.get_object("TimelineLocation").add(self.timelinearea)
 
 	def init_real_file_store(self):
 		tv=self.builder.get_object("RealFilesView")
-		ts=gtk.ListStore(gobject.TYPE_STRING)
+		ts=gtk.ListStore(gobject.TYPE_STRING,gobject.TYPE_OBJECT)
 		tv.set_property("model",ts)
 		self.real_files_store=ts
-		tv.append_column(gtk.TreeViewColumn("Filename",gtk.CellRendererText(),text=0))
-		self.real_files_dict={}
+		tv.append_column(gtk.TreeViewColumn("Filename",gtk.CellRendererPixbuf(),pixbuf=1))
+		tv.append_column(gtk.TreeViewColumn("Image",gtk.CellRendererText(),text=0))
 		self.real_files_view=tv
 
 	def init_virt_file_store(self):
@@ -116,14 +205,27 @@ class Interface():
 		self.virt_files_dict={}
 		self.virt_files_view=tv
 
+	def on_AddRealFile_typefound_callback(self,results,error):
+		if error is not None:
+			print error
+		else:
+			pb=results["pixbuf"]
+			if pb:
+				width=80.0
+				height=60.0
+				try:
+					height=float(results["video"]["height"])*(width/float(results["video"]["width"]))
+				except:
+					raise
+				pb=pb.scale_simple(int(width),int(height),gtk.gdk.INTERP_HYPER)
+			self.real_files_store.append((results["file"],pb))
+
 	def on_AddRealFile(self,*args):
 		try:
 			response = self.source_file_dialog.run()
 			if response == gtk.RESPONSE_OK:
 				fn=self.source_file_dialog.get_filename()
-				if not self.real_files_dict.has_key(fn):
-					self.real_files_store.append((fn,))
-					self.real_files_dict[fn]=None
+				typefind(fn,self.on_AddRealFile_typefound_callback)
 		finally:
 			self.source_file_dialog.hide()
 
@@ -133,7 +235,6 @@ class Interface():
 			iter=self.real_files_store.get_iter(path)
 			fn=self.real_files_store.get(iter,0)[0]
 			self.real_files_store.remove(iter)
-			self.real_files_dict.pop(fn)
 			pos=path[0]-1
 			if pos>=0:
 				self.real_files_view.set_cursor((pos,))
@@ -173,3 +274,6 @@ Interface()
 
 gtk.gdk.threads_init()
 gtk.main()
+
+t=Timeline()
+
